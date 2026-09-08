@@ -1,0 +1,108 @@
+name: Monitor repertuaru Ateneum
+
+on:
+  schedule:
+    # Co 10 minut. GitHub kolejkuje crony "best effort", więc realne
+    # opóźnienie to zwykle 0–15 minut. Chcesz rzadziej? Zmień na '*/30 * * * *'.
+    - cron: "*/10 * * * *"
+
+  # Ręczne uruchomienie z zakładki Actions (również test powiadomienia).
+  workflow_dispatch:
+    inputs:
+      test_notification:
+        description: "Wyślij tylko powiadomienie testowe"
+        type: boolean
+        default: false
+
+  # Opcjonalny "dopalacz": zewnętrzny cron (np. cron-job.org, co 1 min)
+  # może wywołać sprawdzenie natychmiast przez repository_dispatch.
+  repository_dispatch:
+    types: [check-now]
+
+permissions:
+  contents: write # zapis pliku stanu
+  issues: write # zapasowy kanał powiadomień
+
+# Nigdy dwa przebiegi naraz — inaczej wyścig przy commitowaniu stanu.
+concurrency:
+  group: ateneum-watch
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+      NTFY_SERVER: ${{ vars.NTFY_SERVER }}
+      NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
+      TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      RSS_HINTS: ${{ vars.RSS_HINTS }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Dla crona i repository_dispatch kontekst `inputs` jest pusty,
+      # więc `!= true` jest tam prawdziwe i normalne sprawdzenie się wykonuje.
+      - name: Powiadomienie testowe
+        if: ${{ inputs.test_notification == true }}
+        run: python3 check.py --test
+
+      - name: Sprawdź repertuar
+        id: check
+        if: ${{ inputs.test_notification != true }}
+        continue-on-error: true
+        run: python3 check.py
+
+      - name: Zapisz stan
+        if: steps.check.outputs.state_changed == 'true'
+        env:
+          NEW_MONTHS: ${{ steps.check.outputs.new_months }}
+        run: |
+          git config user.name  "ateneum-watch[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state/state.json
+          if git diff --quiet --cached; then
+            echo "Brak zmian w pliku stanu — nic do commitowania."
+            exit 0
+          fi
+          if [ -n "$NEW_MONTHS" ]; then
+            git commit -m "Nowy miesiąc w repertuarze: $NEW_MONTHS"
+          else
+            git commit -m "Aktualizacja stanu monitora"
+          fi
+          git push
+
+      - name: Zgłoś issue (zapasowy kanał powiadomień)
+        if: steps.check.outputs.new_months != '' && vars.CREATE_ISSUE != 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TITLE: ${{ steps.check.outputs.issue_title }}
+          BODY: ${{ steps.check.outputs.issue_body }}
+        run: gh issue create --title "$TITLE" --body "$BODY"
+
+      # SUMMARY idzie przez env, nie przez interpolację w `run` — zawiera
+      # tytuły spektakli pobrane ze strony, czyli treść, której nie kontrolujemy.
+      - name: Podsumowanie przebiegu
+        if: always()
+        env:
+          SUMMARY: ${{ steps.check.outputs.summary }}
+        run: |
+          {
+            echo "### Monitor repertuaru Ateneum"
+            echo
+            echo '```'
+            printf '%s\n' "$SUMMARY"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Celowo wywalamy joba, gdy parser przestał działać albo strona nie
+      # odpowiada — wtedy GitHub sam przyśle maila o nieudanym workflow.
+      # To zabezpieczenie przed cichym przegapieniem publikacji.
+      - name: Zgłoś awarię monitora
+        if: steps.check.outcome == 'failure'
+        run: |
+          echo "::error::Sprawdzenie repertuaru nie powiodło się — monitor może nie wykryć publikacji."
+          exit 1
